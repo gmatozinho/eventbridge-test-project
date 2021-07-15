@@ -1,0 +1,188 @@
+org: gmatozinhokranio
+app: test-project
+service: eventbridge
+
+frameworkVersion: "2"
+
+provider:
+  name: aws
+  runtime: nodejs12.x
+  lambdaHashingVersion: 20201221
+
+
+functions:
+  # Lambda to invoke when event be dispached
+  TestEventBridge:
+    handler: functions/handler.init
+    events:
+      - eventBridge:
+          eventBus: arn:aws:events:#{AWS::Region}:#{AWS::AccountId}:event-bus/MyEventBus
+          pattern:
+            source:
+              - "MyTestApp"
+            detail-type:
+              - "MyTestMessage"
+
+resources:  
+  Transform: 'AWS::Serverless-2016-10-31'
+
+  Parameters:
+    # Webhook parameter
+    MyWebhookURL:
+      Type: String
+      Default: 'https://eventbridgetest.free.beeceptor.com'
+  
+  Resources:
+    #Api gateway and your configs
+    HttpApi:
+      Type: 'AWS::ApiGatewayV2::Api'
+      Properties:
+        Name: http_api_${opt:stage,'dev'}
+        ProtocolType: HTTP
+    HttpApiStage:
+      Type: 'AWS::ApiGatewayV2::Stage'
+      Properties:
+        ApiId: !Ref HttpApi
+        StageName: ${opt:stage,'dev'}
+        AutoDeploy: true
+    HttpApiRoute:
+      Type: 'AWS::ApiGatewayV2::Route'
+      Properties:
+        ApiId: !Ref HttpApi
+        RouteKey: POST /api
+        Target: !Join
+          - /
+          - - integrations
+            - !Ref HttpApiIntegrationEventBridge
+      DependsOn:
+        - HttpApiIntegrationEventBridge
+
+    # EventBus to centralize our rules
+    MyEventBus:
+      Type: AWS::Events::EventBus
+      Properties:
+        Name: "MyEventBus"
+
+    # Api gateway integration with event bridge
+    HttpApiIntegrationEventBridge:
+      Type: 'AWS::ApiGatewayV2::Integration'
+      Properties:
+        ApiId: !Ref HttpApi
+        IntegrationType: AWS_PROXY
+        IntegrationSubtype: EventBridge-PutEvents
+        CredentialsArn: !GetAtt HttpApiIntegrationEventBridgeRole.Arn
+        RequestParameters:
+          Source: 'MyTestApp'
+          DetailType: 'MyTestMessage'
+          Detail: $request.body
+          EventBusName: !Sub arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/MyEventBus
+        PayloadFormatVersion: '1.0'
+        TimeoutInMillis: 10000
+    HttpApiIntegrationEventBridgeRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - apigateway.amazonaws.com
+              Action:
+                - 'sts:AssumeRole'
+        Policies:
+          - PolicyName: ApiDirectWriteEventBridge
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                Action:
+                - events:PutEvents
+                Effect: Allow
+                Resource:
+                  - !Sub arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/MyEventBus
+
+    # EventBridge target for post on webhook
+    MyConnection:
+      Type: AWS::Events::Connection
+      Properties:
+        AuthorizationType: API_KEY
+        Description: 'My connection with an API key'
+        AuthParameters:
+          ApiKeyAuthParameters:
+            ApiKeyName: MyWebhook
+            ApiKeyValue: MyAPIkey
+
+    MyApiDestination:
+      Type: AWS::Events::ApiDestination
+      Properties:
+        Name: 'MyWebhookTest'
+        ConnectionArn: !GetAtt MyConnection.Arn
+        InvocationEndpoint: !Ref MyWebhookURL
+        HttpMethod: POST
+        InvocationRateLimitPerSecond: 10
+
+    # dead letter to send errors
+    MyDeadLetterQueue: 
+      Type: AWS::SQS::Queue
+
+    MyNewEventsRule:
+      Type: "AWS::Events::Rule"
+      Properties:
+        Description: Test Events Rule
+        Name: notify_message
+        EventBusName: !Ref MyEventBus
+        State: ENABLED
+        EventPattern: 
+          source:
+            - "MyTestApp"
+          detail-type:
+            - "MyTestMessage"
+        Targets:
+          - Arn: !GetAtt MyApiDestination.Arn
+            RoleArn: !GetAtt EventBridgeTargetRole.Arn
+            Id: "MyApiDestination"
+            DeadLetterConfig:
+              Arn: !GetAtt MyDeadLetterQueue.Arn
+
+    EventBridgeTargetRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - events.amazonaws.com
+              Action:
+                - sts:AssumeRole      
+        Policies:
+          - PolicyName: AllowAPIdestinationAccess
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: 'events:InvokeApiDestination'
+                  Resource: !GetAtt MyApiDestination.Arn
+
+  # Outputs:
+  #   MyEventBusName:
+  #     Description: Application EventBus Name
+  #     Value: !Ref MyEventBus
+
+  #   MyEventBusArn:
+  #     Description: Application EventBus ARN
+  #     Value: !GetAtt MyEventBus.Arn
+
+  #   MyConnectionName:
+  #     Value: !Ref MyConnection
+  #   MyConnectionArn:
+  #     Value: !GetAtt MyConnection.Arn        
+
+  #   MyApiDestinationName:
+  #     Value: !Ref MyApiDestination
+  #   MyApiDestinationArn:
+  #     Value: !GetAtt MyApiDestination.Arn
+
+  #   EventBridgeTargetRoleArn:
+  #     Value: !GetAtt EventBridgeTargetRole.Arn
